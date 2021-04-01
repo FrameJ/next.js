@@ -25,6 +25,7 @@ import { loadEnvConfig } from '@next/env'
 import { recursiveDelete } from '../lib/recursive-delete'
 import { verifyTypeScriptSetup } from '../lib/verifyTypeScriptSetup'
 import {
+  BUILD_ID_FILE,
   BUILD_MANIFEST,
   CLIENT_STATIC_FILES_PATH,
   EXPORT_DETAIL,
@@ -76,6 +77,7 @@ import getBaseWebpackConfig from './webpack-config'
 import { PagesManifest } from './webpack/plugins/pages-manifest-plugin'
 import { writeBuildId } from './write-build-id'
 import * as Log from './output/log'
+import { readFileSync } from 'fs'
 
 const staticCheckWorker = require.resolve('./utils')
 
@@ -115,9 +117,11 @@ export default async function build(
   const { loadedEnvFiles } = loadEnvConfig(dir, false, Log)
 
   const config = loadConfig(PHASE_PRODUCTION_BUILD, dir, conf)
-  const { target } = config
-  const buildId = await generateBuildId(config.generateBuildId, nanoid)
+  const { target, useLatestBuild } = config
   const distDir = path.join(dir, config.distDir)
+  const buildId = useLatestBuild
+    ? readFileSync(path.join(distDir, BUILD_ID_FILE), 'utf8')
+    : await generateBuildId(config.generateBuildId, nanoid)
 
   const { headers, rewrites, redirects } = await loadCustomRoutes(config)
 
@@ -335,122 +339,123 @@ export default async function build(
     JSON.stringify(routesManifest),
     'utf8'
   )
+  if (!useLatestBuild) {
+    const configs = await Promise.all([
+      getBaseWebpackConfig(dir, {
+        tracer,
+        buildId,
+        reactProductionProfiling,
+        isServer: false,
+        config,
+        target,
+        pagesDir,
+        entrypoints: entrypoints.client,
+        rewrites,
+      }),
+      getBaseWebpackConfig(dir, {
+        tracer,
+        buildId,
+        reactProductionProfiling,
+        isServer: true,
+        config,
+        target,
+        pagesDir,
+        entrypoints: entrypoints.server,
+        rewrites,
+      }),
+    ])
 
-  const configs = await Promise.all([
-    getBaseWebpackConfig(dir, {
-      tracer,
-      buildId,
-      reactProductionProfiling,
-      isServer: false,
-      config,
-      target,
-      pagesDir,
-      entrypoints: entrypoints.client,
-      rewrites,
-    }),
-    getBaseWebpackConfig(dir, {
-      tracer,
-      buildId,
-      reactProductionProfiling,
-      isServer: true,
-      config,
-      target,
-      pagesDir,
-      entrypoints: entrypoints.server,
-      rewrites,
-    }),
-  ])
-
-  const clientConfig = configs[0]
-
-  if (
-    clientConfig.optimization &&
-    (clientConfig.optimization.minimize !== true ||
-      (clientConfig.optimization.minimizer &&
-        clientConfig.optimization.minimizer.length === 0))
-  ) {
-    Log.warn(
-      `Production code optimization has been disabled in your project. Read more: https://err.sh/vercel/next.js/minification-disabled`
-    )
-  }
-
-  const webpackBuildStart = process.hrtime()
-
-  let result: CompilerResult = { warnings: [], errors: [] }
-  // TODO: why do we need this?? https://github.com/vercel/next.js/issues/8253
-  if (isLikeServerless) {
-    const clientResult = await runCompiler(clientConfig)
-    // Fail build if clientResult contains errors
-    if (clientResult.errors.length > 0) {
-      result = {
-        warnings: [...clientResult.warnings],
-        errors: [...clientResult.errors],
-      }
-    } else {
-      const serverResult = await runCompiler(configs[1])
-      result = {
-        warnings: [...clientResult.warnings, ...serverResult.warnings],
-        errors: [...clientResult.errors, ...serverResult.errors],
-      }
-    }
-  } else {
-    result = await runCompiler(configs)
-  }
-
-  const webpackBuildEnd = process.hrtime(webpackBuildStart)
-  if (buildSpinner) {
-    buildSpinner.stopAndPersist()
-  }
-
-  result = formatWebpackMessages(result)
-
-  if (result.errors.length > 0) {
-    // Only keep the first error. Others are often indicative
-    // of the same problem, but confuse the reader with noise.
-    if (result.errors.length > 1) {
-      result.errors.length = 1
-    }
-    const error = result.errors.join('\n\n')
-
-    console.error(chalk.red('Failed to compile.\n'))
+    const clientConfig = configs[0]
 
     if (
-      error.indexOf('private-next-pages') > -1 &&
-      error.indexOf('does not contain a default export') > -1
+      clientConfig.optimization &&
+      (clientConfig.optimization.minimize !== true ||
+        (clientConfig.optimization.minimizer &&
+          clientConfig.optimization.minimizer.length === 0))
     ) {
-      const page_name_regex = /'private-next-pages\/(?<page_name>[^']*)'/
-      const parsed = page_name_regex.exec(error)
-      const page_name = parsed && parsed.groups && parsed.groups.page_name
-      throw new Error(
-        `webpack build failed: found page without a React Component as default export in pages/${page_name}\n\nSee https://err.sh/vercel/next.js/page-without-valid-component for more info.`
+      Log.warn(
+        `Production code optimization has been disabled in your project. Read more: https://err.sh/vercel/next.js/minification-disabled`
       )
     }
 
-    console.error(error)
-    console.error()
+    const webpackBuildStart = process.hrtime()
 
-    if (
-      error.indexOf('private-next-pages') > -1 ||
-      error.indexOf('__next_polyfill__') > -1
-    ) {
-      throw new Error(
-        '> webpack config.resolve.alias was incorrectly overridden. https://err.sh/vercel/next.js/invalid-resolve-alias'
-      )
-    }
-    throw new Error('> Build failed because of webpack errors')
-  } else {
-    telemetry.record(
-      eventBuildCompleted(pagePaths, {
-        durationInSeconds: webpackBuildEnd[0],
-      })
-    )
-
-    if (result.warnings.length > 0) {
-      Log.warn('Compiled with warnings\n')
-      console.warn(result.warnings.join('\n\n'))
-      console.warn()
+    let result: CompilerResult = { warnings: [], errors: [] }
+    // TODO: why do we need this?? https://github.com/vercel/next.js/issues/8253
+    if (isLikeServerless) {
+      const clientResult = await runCompiler(clientConfig)
+      // Fail build if clientResult contains errors
+      if (clientResult.errors.length > 0) {
+        result = {
+          warnings: [...clientResult.warnings],
+          errors: [...clientResult.errors],
+        }
+      } else {
+        const serverResult = await runCompiler(configs[1])
+        result = {
+          warnings: [...clientResult.warnings, ...serverResult.warnings],
+          errors: [...clientResult.errors, ...serverResult.errors],
+        }
+      }
     } else {
-      Log.info('Compiled successfully')
+      result = await runCompiler(configs)
+    }
+
+    const webpackBuildEnd = process.hrtime(webpackBuildStart)
+    if (buildSpinner) {
+      buildSpinner.stopAndPersist()
+    }
+
+    result = formatWebpackMessages(result)
+
+    if (result.errors.length > 0) {
+      // Only keep the first error. Others are often indicative
+      // of the same problem, but confuse the reader with noise.
+      if (result.errors.length > 1) {
+        result.errors.length = 1
+      }
+      const error = result.errors.join('\n\n')
+
+      console.error(chalk.red('Failed to compile.\n'))
+
+      if (
+        error.indexOf('private-next-pages') > -1 &&
+        error.indexOf('does not contain a default export') > -1
+      ) {
+        const page_name_regex = /'private-next-pages\/(?<page_name>[^']*)'/
+        const parsed = page_name_regex.exec(error)
+        const page_name = parsed && parsed.groups && parsed.groups.page_name
+        throw new Error(
+          `webpack build failed: found page without a React Component as default export in pages/${page_name}\n\nSee https://err.sh/vercel/next.js/page-without-valid-component for more info.`
+        )
+      }
+
+      console.error(error)
+      console.error()
+
+      if (
+        error.indexOf('private-next-pages') > -1 ||
+        error.indexOf('__next_polyfill__') > -1
+      ) {
+        throw new Error(
+          '> webpack config.resolve.alias was incorrectly overridden. https://err.sh/vercel/next.js/invalid-resolve-alias'
+        )
+      }
+      throw new Error('> Build failed because of webpack errors')
+    } else {
+      telemetry.record(
+        eventBuildCompleted(pagePaths, {
+          durationInSeconds: webpackBuildEnd[0],
+        })
+      )
+
+      if (result.warnings.length > 0) {
+        Log.warn('Compiled with warnings\n')
+        console.warn(result.warnings.join('\n\n'))
+        console.warn()
+      } else {
+        Log.info('Compiled successfully')
+      }
     }
   }
 
